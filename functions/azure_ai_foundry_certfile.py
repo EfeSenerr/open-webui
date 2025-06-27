@@ -33,6 +33,10 @@ import time
 import jwt
 import ssl
 import tempfile
+import uuid
+import sys
+import cryptography
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from pydantic_core import core_schema
 
@@ -235,14 +239,38 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         Raises:
             ValueError: If required environment variables are not set.
         """
-        if not self.valves.AZURE_TENANT_ID:
-            raise ValueError("AZURE_TENANT_ID is required!")
-        if not self.valves.AZURE_CLIENT_ID:
-            raise ValueError("AZURE_CLIENT_ID is required!")
-          # Check for certificate authentication - either PEM or P12
-        cert_content = self.valves.AZURE_CLIENT_CERTIFICATE.get_decrypted()
-        private_key_content = self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted()
-        p12_content = self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted()
+        if not self.valves.AZURE_TENANT_ID or self.valves.AZURE_TENANT_ID == "your-tenant-id-here":
+            raise ValueError("AZURE_TENANT_ID is required and must be configured!")
+        if not self.valves.AZURE_CLIENT_ID or self.valves.AZURE_CLIENT_ID == "your-client-id-here":
+            raise ValueError("AZURE_CLIENT_ID is required and must be configured!")
+        
+        # Check for certificate authentication - either PEM or P12
+        # Handle both EncryptedStr and regular str types safely
+        cert_content = ""
+        private_key_content = ""
+        p12_content = ""
+        
+        try:
+            cert_content = (
+                self.valves.AZURE_CLIENT_CERTIFICATE.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_CERTIFICATE or "")
+            )
+            private_key_content = (
+                self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_PRIVATE_KEY, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
+            )
+            p12_content = (
+                self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE_P12, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
+            )
+        except Exception:
+            # Fallback to string values if EncryptedStr methods fail
+            cert_content = str(self.valves.AZURE_CLIENT_CERTIFICATE or "")
+            private_key_content = str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
+            p12_content = str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
         
         if not ((cert_content and private_key_content) or p12_content):
             raise ValueError("Either AZURE_CLIENT_CERTIFICATE + AZURE_CLIENT_PRIVATE_KEY or AZURE_CLIENT_CERTIFICATE_P12 is required!")
@@ -394,33 +422,53 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         Returns:
             List of dictionaries containing pipe id and name.
         """
-        self.validate_environment()
+        try:
+            self.validate_environment()
+        except Exception as e:
+            # If validation fails (e.g., during initial loading), return a placeholder
+            # This prevents crashes during function discovery
+            log = logging.getLogger(__name__)
+            log.debug(f"Azure function validation failed during discovery: {e}")
+            return [{
+                "id": "azure-openai-not-configured",
+                "name": "Azure OpenAI (Configuration Required)"
+            }]
         
-        pipes = []
-        
-        # Add primary deployment
-        if self.valves.AZURE_OPENAI_DEPLOYMENT:
-            pipes.append({
-                "id": self.valves.AZURE_OPENAI_DEPLOYMENT,
-                "name": f"Azure OpenAI: {self.valves.AZURE_OPENAI_DEPLOYMENT}"
-            })
-        
-        # Add additional deployments
-        additional_deployments = self.parse_deployments(self.valves.ADDITIONAL_DEPLOYMENTS)
-        for deployment in additional_deployments:
-            pipes.append({
-                "id": deployment,
-                "name": f"Azure OpenAI: {deployment}"
-            })
-        
-        # If no deployments configured, return default
-        if not pipes:
-            pipes.append({
-                "id": "azure-openai",
-                "name": "Azure OpenAI"
-            })
-        
-        return pipes
+        try:
+            pipes = []
+            
+            # Add primary deployment
+            if self.valves.AZURE_OPENAI_DEPLOYMENT:
+                pipes.append({
+                    "id": self.valves.AZURE_OPENAI_DEPLOYMENT,
+                    "name": f"Azure OpenAI: {self.valves.AZURE_OPENAI_DEPLOYMENT}"
+                })
+            
+            # Add additional deployments
+            additional_deployments = self.parse_deployments(self.valves.ADDITIONAL_DEPLOYMENTS)
+            for deployment in additional_deployments:
+                pipes.append({
+                    "id": deployment,
+                    "name": f"Azure OpenAI: {deployment}"
+                })
+            
+            # If no deployments configured, return default
+            if not pipes:
+                pipes.append({
+                    "id": "azure-openai",
+                    "name": "Azure OpenAI"
+                })
+            
+            return pipes
+            
+        except Exception as e:
+            # Fallback in case there are any other issues
+            log = logging.getLogger(__name__)
+            log.debug(f"Error generating pipes list: {e}")
+            return [{
+                "id": "azure-openai-error",
+                "name": "Azure OpenAI (Error)"
+            }]
 
     async def stream_processor(
         self, content: aiohttp.StreamReader, __event_emitter__=None
@@ -475,6 +523,20 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         """
         log = logging.getLogger("azure_openai.pipe")
         log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+
+        # Validate configuration first
+        try:
+            self.validate_environment()
+        except Exception as e:
+            error_msg = f"Azure OpenAI function not properly configured: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": error_msg, "done": True},
+                    }
+                )
+            return f"Error: {error_msg}"
 
         # Validate the request body
         self.validate_body(body)
@@ -643,11 +705,7 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
 
     def _load_certificate_and_key(self) -> tuple:
         """
-        FIXED VERSION: Load certificate and private key with proper line break handling.
-        
-        The main issue was that line breaks were being lost in the combined PEM creation,
-        causing the certificate and key to become single long lines instead of properly
-        formatted PEM blocks.
+        Load certificate and private key with proper line break handling.
         
         Returns:
             Tuple of (certificate, private_key) objects
@@ -656,164 +714,87 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
             ValueError: If certificate loading fails
         """
         try:
-            # Try PEM format first (.crt and .pem files are both PEM format)
-            cert_content = self.valves.AZURE_CLIENT_CERTIFICATE.get_decrypted()
-            private_key_content = self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted()
+            # Get certificate and private key content
+            cert_content = (
+                self.valves.AZURE_CLIENT_CERTIFICATE.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_CERTIFICATE or "")
+            )
+            private_key_content = (
+                self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_PRIVATE_KEY, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
+            )
             
             if cert_content and private_key_content:
-                # Load certificate (handles both .crt and .pem formats)
+                log = logging.getLogger(__name__)
+                log.info("Loading certificate and private key from PEM format")
+                
+                # Check for CSR instead of certificate
+                if "-----BEGIN CERTIFICATE REQUEST-----" in cert_content:
+                    raise ValueError("Certificate Signing Request (.csr) provided instead of certificate (.crt)")
+                
+                # Load certificate
+                cert = x509.load_pem_x509_certificate(cert_content.encode())
+                
+                # Restore line breaks in PEM content if needed
+                cert_content_fixed = self.restore_pem_line_breaks(cert_content, "CERTIFICATE")
+                private_key_content_fixed = self.restore_pem_line_breaks(private_key_content, "PRIVATE KEY")
+                
+                # Get password if provided
+                password_content = (
+                    self.valves.AZURE_PRIVATE_KEY_PASSWORD.get_decrypted() 
+                    if hasattr(self.valves.AZURE_PRIVATE_KEY_PASSWORD, 'get_decrypted') 
+                    else str(self.valves.AZURE_PRIVATE_KEY_PASSWORD or "")
+                )
+                key_password = password_content.encode() if password_content else None
+                
+                # Try loading private key with various approaches
                 try:
-                    # Check if it's a CSR instead of a certificate
-                    if "-----BEGIN CERTIFICATE REQUEST-----" in cert_content:
-                        raise ValueError("You provided a Certificate Signing Request (.csr) instead of a certificate. You need to use the actual certificate file (.crt) generated from: openssl x509 -req -days 365 -in aadappcert.csr -signkey aadappcert.pem -out aadappcert.crt")
-                    
-                    cert = x509.load_pem_x509_certificate(cert_content.encode())
-                except Exception as cert_error:
-                    if "Certificate Signing Request" in str(cert_error):
-                        raise cert_error  # Re-raise our custom CSR error
-                    raise ValueError(f"Failed to load certificate: {str(cert_error)}. Ensure the certificate is in PEM format with proper headers (-----BEGIN CERTIFICATE----- not -----BEGIN CERTIFICATE REQUEST-----).")
-                
-                # Load private key (with optional password)
-                password = self.valves.AZURE_PRIVATE_KEY_PASSWORD.get_decrypted()
-                key_password = password.encode() if password else None
-                
-                # Preprocess the private key content to ensure clean format
-                private_key_content_clean = private_key_content.strip()
-                # Ensure proper line endings (some systems might have \r\n vs \n issues)
-                private_key_content_clean = private_key_content_clean.replace('\r\n', '\n').replace('\r', '\n')
-                
-                # Add debugging for troubleshooting
-                import logging
-                import sys
-                log = logging.getLogger("azure_openai.auth")
-                log.info(f"🔄 Trying FIXED combined PEM approach (restored line breaks)...")
-                
-                # CRITICAL FIX: Restore proper line breaks in flattened PEM content
-                def restore_pem_line_breaks(pem_content, block_type):
-                    """Restore proper line breaks in PEM content that may have been flattened."""
-                    
-                    # Find PEM markers
-                    begin_marker = f"-----BEGIN {block_type}-----"
-                    end_marker = f"-----END {block_type}-----"
-                    
-                    # Check if content already has proper line breaks
-                    lines = pem_content.split('\n')
-                    non_empty_lines = [line.strip() for line in lines if line.strip()]
-                    
-                    # If we have proper line structure, return as-is
-                    if len(non_empty_lines) > 10:
-                        return pem_content
-                    
-                    # Content appears flattened - need to restore line breaks
-                    log.info(f"🔧 Restoring line breaks for {block_type} (detected {len(non_empty_lines)} lines)")
-                    
-                    # Find the base64 content between markers
-                    begin_idx = pem_content.find(begin_marker)
-                    end_idx = pem_content.find(end_marker)
-                    
-                    if begin_idx == -1 or end_idx == -1:
-                        log.warning(f"⚠️  Could not find PEM markers for {block_type}")
-                        return pem_content
-                    
-                    # Extract the base64 content (everything between markers)
-                    base64_start = begin_idx + len(begin_marker)
-                    base64_content = pem_content[base64_start:end_idx].strip()
-                    
-                    # CRITICAL: The issue is spaces in base64 content instead of newlines
-                    # Remove ALL whitespace (spaces, newlines, tabs) and rebuild with proper 64-char lines
-                    base64_clean = ''.join(base64_content.split())
-                    
-                    # Split into 64-character lines (standard PEM format)
-                    base64_lines = []
-                    for i in range(0, len(base64_clean), 64):
-                        base64_lines.append(base64_clean[i:i+64])
-                    
-                    # Reconstruct the PEM with proper formatting
-                    reconstructed = begin_marker + '\n' + '\n'.join(base64_lines) + '\n' + end_marker
-                    
-                    log.info(f"✅ Restored {len(base64_lines)} base64 lines for {block_type}")
-                    return reconstructed
-                
-                try:
-                    # Restore line breaks in both certificate and private key
-                    cert_content_fixed = restore_pem_line_breaks(cert_content.strip(), "CERTIFICATE")
-                    key_content_fixed = restore_pem_line_breaks(private_key_content_clean, "PRIVATE KEY")
-                    
-                    # Combine using the EXACT pattern that works in our successful tests
-                    # Use single newline separation like our working test_combined_pem.py
-                    combined_pem = cert_content_fixed.strip() + '\n' + key_content_fixed.strip()
-                    
-                    log.info(f"📝 FIXED Combined PEM length: {len(combined_pem)} characters")
-                    
-                    # Check line structure to verify the fix
-                    all_lines = combined_pem.split('\n')
-                    non_empty_lines = [line for line in all_lines if line.strip()]
-                    log.info(f"📝 FIXED Non-empty lines: {len(non_empty_lines)} (should be ~50, not 2!)")
-                    
-                    if len(non_empty_lines) < 10:
-                        log.warning(f"⚠️  Line break issue still detected! Only {len(non_empty_lines)} lines found")
-                        log.info(f"📝 First few lines: {non_empty_lines[:3] if non_empty_lines else 'None'}")
-                    else:                        log.info(f"✅ Line breaks restored successfully: {len(non_empty_lines)} lines")                    
-                    # Try to load the private key from the FIXED combined PEM
+                    # First try: Combined PEM approach (works for some certificates)
+                    combined_pem = cert_content_fixed.strip() + '\n' + private_key_content_fixed.strip()
                     private_key = serialization.load_pem_private_key(
                         combined_pem.encode('utf-8'),
                         password=key_password
                     )
-                    log.info("✅ FIXED Combined PEM approach succeeded! Line breaks were the issue.")
-                    
-                except Exception as combined_error:
-                    log.warning(f"❌ FIXED Combined PEM approach failed: {combined_error}")
-                    
-                    # Fallback to standard approach
+                except Exception:
                     try:
+                        # Second try: Standard approach
                         private_key = serialization.load_pem_private_key(
-                            private_key_content_clean.encode('utf-8'),
+                            private_key_content_fixed.encode('utf-8'),
                             password=key_password
                         )
-                        log.info("✅ Standard approach succeeded!")
-                        
-                    except Exception as key_error:
-                        # Final fallback: alternative approaches
-                        log.warning(f"❌ Standard approach failed: {key_error}")
-                        
-                        alternative_attempts = [
-                            ("Original content", lambda: serialization.load_pem_private_key(private_key_content.encode('utf-8'), password=key_password)),
-                            ("No password", lambda: serialization.load_pem_private_key(private_key_content_clean.encode('utf-8'), password=None)),
-                        ]
-                        
-                        private_key = None
-                        for i, (name, attempt) in enumerate(alternative_attempts):
-                            try:
-                                log.info(f"Trying alternative approach {i+1}: {name}...")
-                                private_key = attempt()
-                                log.info(f"✅ Alternative approach {i+1} succeeded!")
-                                break
-                            except Exception as alt_error:
-                                log.warning(f"❌ Alternative approach {i+1} failed: {alt_error}")
-                                continue
-                        
-                        if private_key is None:
-                            # All attempts failed
-                            error_msg = str(key_error)
-                            if "unsupported" in error_msg.lower():
-                                raise ValueError(f"Failed to load private key: Unsupported key format or algorithm. Your key appears to be in a format that's not supported. Please ensure you're using an RSA private key in PKCS#8 format (-----BEGIN PRIVATE KEY-----). Original error: {error_msg}")
-                            else:
-                                raise ValueError(f"Failed to load private key: {error_msg}. Ensure the private key is in PEM format (PKCS#8 or traditional RSA format).")
+                    except Exception:
+                        # Third try: Without password
+                        private_key = serialization.load_pem_private_key(
+                            private_key_content_fixed.encode('utf-8'),
+                            password=None
+                        )
                 
-                log.info(f"Private key loaded successfully: {type(private_key).__name__}")
+                log.info(f"Certificate and private key loaded successfully: {type(private_key).__name__}")
                 return cert, private_key
             
             # Try P12/PFX format if PEM not available
-            p12_content = self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted()
+            p12_content = (
+                self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted() 
+                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE_P12, 'get_decrypted') 
+                else str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
+            )
+            
             if p12_content:
                 try:
                     # Decode base64 P12 content
                     p12_bytes = base64.b64decode(p12_content)
                     
-                    # Load P12 certificate
-                    p12_password = self.valves.AZURE_P12_PASSWORD.get_decrypted()
-                    password_bytes = p12_password.encode() if p12_password else None
+                    # Get P12 password
+                    p12_password_content = (
+                        self.valves.AZURE_P12_PASSWORD.get_decrypted() 
+                        if hasattr(self.valves.AZURE_P12_PASSWORD, 'get_decrypted') 
+                        else str(self.valves.AZURE_P12_PASSWORD or "")
+                    )
+                    password_bytes = p12_password_content.encode() if p12_password_content else None
                     
+                    # Load P12 certificate
                     private_key, cert, additional_certs = serialization.pkcs12.load_key_and_certificates(
                         p12_bytes, password_bytes
                     )
@@ -826,302 +807,55 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
             
         except Exception as e:
             raise ValueError(f"Certificate loading failed: {str(e)}")
+
+    def restore_pem_line_breaks(self, pem_content: str, block_type: str) -> str:
         """
-        Load certificate and private key from the configuration.
-        Supports various certificate formats:
-        - .crt files (X.509 certificates in PEM format)
-        - .pem files (PEM certificates)
-        - .p12/.pfx files (PKCS#12 format)
+        Restore proper line breaks in PEM content that may have been flattened.
         
+        Args:
+            pem_content: PEM content that might have missing line breaks
+            block_type: Type of PEM block (e.g., "CERTIFICATE", "PRIVATE KEY")
+            
         Returns:
-            Tuple of (certificate, private_key) objects
-            
-        Raises:
-            ValueError: If certificate loading fails
+            PEM content with proper line breaks
         """
-        try:
-            # Try PEM format first (.crt and .pem files are both PEM format)
-            cert_content = self.valves.AZURE_CLIENT_CERTIFICATE.get_decrypted()
-            private_key_content = self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted()
-            
-            # Add debugging for EncryptedStr processing
-            import logging
-            log = logging.getLogger("azure_openai.auth")
-            
-            log.info(f"EncryptedStr debugging:")
-            log.info(f"  Raw valve value type: {type(self.valves.AZURE_CLIENT_PRIVATE_KEY)}")
-            log.info(f"  Raw valve value length: {len(str(self.valves.AZURE_CLIENT_PRIVATE_KEY))}")
-            log.info(f"  Raw valve starts with encrypted: {str(self.valves.AZURE_CLIENT_PRIVATE_KEY).startswith('encrypted:')}")
-            log.info(f"  Decrypted content type: {type(private_key_content)}")
-            log.info(f"  Decrypted content length: {len(private_key_content) if private_key_content else 0}")
-            if private_key_content:
-                log.info(f"  Decrypted content starts: {private_key_content[:50]}")
-                log.info(f"  Decrypted content ends: {private_key_content[-50:]}")
-                
-                # Check for common corruption signs
-                has_null_bytes = '\x00' in private_key_content
-                has_non_printable = any(ord(c) < 32 and c not in '\n\r\t' for c in private_key_content)
-                log.info(f"  Contains null bytes: {has_null_bytes}")
-                log.info(f"  Contains non-printable chars: {has_non_printable}")
-            
-            if cert_content and private_key_content:
-                # Load certificate (handles both .crt and .pem formats)
-                try:
-                    # Check if it's a CSR instead of a certificate
-                    if "-----BEGIN CERTIFICATE REQUEST-----" in cert_content:
-                        raise ValueError("You provided a Certificate Signing Request (.csr) instead of a certificate. You need to use the actual certificate file (.crt) generated from: openssl x509 -req -days 365 -in aadappcert.csr -signkey aadappcert.pem -out aadappcert.crt")
-                    
-                    cert = x509.load_pem_x509_certificate(cert_content.encode())
-                except Exception as cert_error:
-                    if "Certificate Signing Request" in str(cert_error):
-                        raise cert_error  # Re-raise our custom CSR error
-                    raise ValueError(f"Failed to load certificate: {str(cert_error)}. Ensure the certificate is in PEM format with proper headers (-----BEGIN CERTIFICATE----- not -----BEGIN CERTIFICATE REQUEST-----).")
-                
-                # Load private key (with optional password)
-                password = self.valves.AZURE_PRIVATE_KEY_PASSWORD.get_decrypted()
-                key_password = password.encode() if password else None
-                
-                # Preprocess the private key content to ensure clean format
-                # This matches what works in the standalone test
-                private_key_content_clean = private_key_content.strip()
-                
-                # Ensure proper line endings (some systems might have \r\n vs \n issues)
-                private_key_content_clean = private_key_content_clean.replace('\r\n', '\n').replace('\r', '\n')
-                
-                # Add debugging information
-                import logging
-                log = logging.getLogger("azure_openai.auth")
-                log.info(f"Private key format validation:")
-                log.info(f"  Length: {len(private_key_content_clean)} characters")
-                log.info(f"  Starts with: {private_key_content_clean[:50]}...")
-                log.info(f"  Contains RSA header: {'-----BEGIN RSA PRIVATE KEY-----' in private_key_content_clean}")
-                log.info(f"  Contains PKCS#8 header: {'-----BEGIN PRIVATE KEY-----' in private_key_content_clean}")
-                log.info(f"  Contains encrypted header: {'-----BEGIN ENCRYPTED PRIVATE KEY-----' in private_key_content_clean}")                # Based on GitHub issue, try the combined PEM approach FIRST
-                # This has been successful for others with the same OpenSSL error
-                log.info("🔄 Trying combined PEM approach first (based on GitHub issue solution)...")
-                  # Add comprehensive environment debugging
-                try:
-                    import ssl
-                    import sys
-                    import cryptography
-                    from cryptography.hazmat.backends import default_backend
-                    from cryptography.hazmat.backends.openssl import backend as openssl_backend
-                    
-                    log.info(f"🔍 Environment debug:")
-                    log.info(f"  SSL version: {ssl.OPENSSL_VERSION}")
-                    log.info(f"  Cryptography version: {cryptography.__version__}")
-                    log.info(f"  OpenSSL backend version: {openssl_backend.openssl_version_text()}")
-                    log.info(f"  Python version: {sys.version}")                    
-                except Exception as env_error:
-                    log.warning(f"Environment debug failed: {env_error}")
-                
-                try:
-                    # Create combined PEM file content (cert + key) as suggested in the GitHub issue
-                    # CRITICAL: Ensure proper line breaks are preserved
-                    cert_content_normalized = cert_content.strip()
-                    key_content_normalized = private_key_content_clean.strip()
-                    
-                    # Ensure both parts end with newlines and combine with double newline separation
-                    if not cert_content_normalized.endswith('\n'):
-                        cert_content_normalized += '\n'
-                    if not key_content_normalized.endswith('\n'):
-                        key_content_normalized += '\n'
-                    
-                    combined_pem = cert_content_normalized + '\n' + key_content_normalized
-                    
-                    log.info(f"📝 Combined PEM length: {len(combined_pem)} characters")
-                    log.info(f"📝 Combined PEM starts with: {combined_pem[:60]}...")
-                    
-                    # Add detailed diagnostics about the combined PEM content
-                    cert_lines = [line for line in combined_pem.split('\n') if line.strip()]
-                    log.info(f"📝 Combined PEM has {len(cert_lines)} non-empty lines")
-                    log.info(f"📝 First line: {cert_lines[0] if cert_lines else 'None'}")
-                    log.info(f"📝 Last line: {cert_lines[-1] if cert_lines else 'None'}")
-                    
-                    # Check for specific markers
-                    has_cert_begin = '-----BEGIN CERTIFICATE-----' in combined_pem
-                    has_cert_end = '-----END CERTIFICATE-----' in combined_pem
-                    has_key_begin = '-----BEGIN PRIVATE KEY-----' in combined_pem
-                    has_key_end = '-----END PRIVATE KEY-----' in combined_pem
-                    log.info(f"📝 Has cert markers: begin={has_cert_begin}, end={has_cert_end}")
-                    log.info(f"📝 Has key markers: begin={has_key_begin}, end={has_key_end}")
-                    
-                    # Try to load just the certificate part first to ensure it's not a cert issue
-                    try:
-                        cert_test = x509.load_pem_x509_certificate(cert_content.encode())
-                        log.info("📝 Certificate part loads OK")
-                    except Exception as cert_test_error:
-                        log.warning(f"📝 Certificate part fails: {cert_test_error}")
-                    
-                    # Save exact content to debug file for comparison
-                    debug_file_path = "/tmp/openwebui_combined_debug.pem"
-                    try:
-                        with open(debug_file_path, 'w') as debug_file:
-                            debug_file.write(combined_pem)
-                        log.info(f"📝 Saved debug content to {debug_file_path}")
-                        
-                        # Try loading from the file we just wrote
-                        with open(debug_file_path, 'rb') as debug_file:
-                            file_content = debug_file.read()
-                        
-                        file_key = serialization.load_pem_private_key(
-                            file_content,
-                            password=key_password
-                        )
-                        log.info("✅ Loading from debug file succeeded! The issue is memory vs file.")
-                        private_key = file_key
-                        
-                    except Exception as file_debug_error:
-                        log.warning(f"📝 Debug file approach failed: {file_debug_error}")
-                        
-                        # Try multiple backends explicitly
-                        backends_to_try = [
-                            ("default", default_backend()),
-                            ("explicit openssl", openssl_backend if 'openssl_backend' in locals() else None)
-                        ]
-                        
-                        key_load_error = None
-                        for backend_name, backend in backends_to_try:
-                            if backend is None:
-                                continue
-                                
-                            try:
-                                log.info(f"📝 Trying {backend_name} backend...")
-                                private_key = serialization.load_pem_private_key(
-                                    combined_pem.encode('utf-8'),
-                                    password=key_password,
-                                    backend=backend
-                                )
-                                log.info(f"✅ {backend_name} backend succeeded!")
-                                break
-                            except Exception as backend_error:
-                                log.warning(f"❌ {backend_name} backend failed: {backend_error}")
-                                key_load_error = backend_error
-                        else:
-                            # If all backends failed, raise the last error
-                            if key_load_error:
-                                raise key_load_error
-                            else:
-                                raise Exception("All backend attempts failed")
-                    
-                    log.info("✅ Combined PEM approach succeeded! This was the solution.")                    
-                except Exception as combined_error:
-                    log.warning(f"❌ Combined PEM approach failed: {combined_error}")
-                    
-                    # Let's try writing to a temporary file and loading from there
-                    # This might help if there's an encoding issue with in-memory content
-                    try:
-                        import tempfile
-                        import os
-                        
-                        log.info("🔄 Trying temporary file approach...")
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
-                            temp_file.write(combined_pem)
-                            temp_file_path = temp_file.name
-                        
-                        try:
-                            with open(temp_file_path, 'rb') as f:
-                                temp_content = f.read()
-                            
-                            private_key = serialization.load_pem_private_key(
-                                temp_content,
-                                password=key_password
-                            )
-                            log.info("✅ Temporary file approach succeeded!")
-                            
-                        finally:
-                            # Clean up temp file
-                            try:
-                                os.unlink(temp_file_path)
-                            except:
-                                pass
-                                
-                    except Exception as temp_error:
-                        log.warning(f"❌ Temporary file approach failed: {temp_error}")
-                        
-                        log.info("🔄 Falling back to standard approach...")
-                        
-                        try:
-                            # Standard approach: load private key directly
-                            private_key = serialization.load_pem_private_key(
-                                private_key_content_clean.encode('utf-8'),
-                                password=key_password
-                            )
-                            log.info("✅ Standard approach succeeded!")
-                            
-                        except Exception as key_error:
-                            # If both approaches fail, try alternative methods
-                            log.warning(f"❌ Standard approach also failed: {key_error}")
-                            log.info("🔄 Trying alternative approaches...")
-                            
-                            # Try with different encodings and formats
-                            alternative_attempts = [
-                                # Try with original content (no preprocessing)
-                                lambda: serialization.load_pem_private_key(private_key_content.encode('utf-8'), password=key_password),
-                                # Try with latin-1 encoding (handles some binary issues)
-                                lambda: serialization.load_pem_private_key(private_key_content_clean.encode('latin-1'), password=key_password),
-                                # Try without password even if one was provided
-                                lambda: serialization.load_pem_private_key(private_key_content_clean.encode('utf-8'), password=None),
-                                # Try with original content and no password
-                                lambda: serialization.load_pem_private_key(private_key_content.encode('utf-8'), password=None),
-                                # Try with raw string value (bypass EncryptedStr processing)
-                                lambda: serialization.load_pem_private_key(str(self.valves.AZURE_CLIENT_PRIVATE_KEY).encode('utf-8'), password=None),
-                                # Try with alternative raw content extraction
-                                lambda: serialization.load_pem_private_key(self._get_raw_private_key_content().encode('utf-8'), password=None) if self._get_raw_private_key_content() else None,
-                            ]
-                            
-                            private_key = None
-                            last_error = key_error
-                            for i, attempt in enumerate(alternative_attempts):
-                                try:
-                                    log.info(f"Trying alternative approach {i+1}...")
-                                    result = attempt()
-                                    if result is not None:  # Handle None results from lambda
-                                        private_key = result
-                                        log.info(f"Alternative approach {i+1} succeeded!")
-                                        break
-                                    else:
-                                        log.warning(f"Alternative approach {i+1} returned None")
-                                except Exception as alt_error:
-                                    log.warning(f"Alternative approach {i+1} failed: {alt_error}")
-                                    last_error = alt_error
-                                    continue
-                            
-                            if private_key is None:
-                                # All attempts failed, provide detailed error information
-                                error_msg = str(last_error)
-                                if "unsupported" in error_msg.lower():
-                                    raise ValueError(f"Failed to load private key: Unsupported key format or algorithm. Your key appears to be in a format that's not supported. Please ensure you're using an RSA private key in PKCS#8 format (-----BEGIN PRIVATE KEY-----). Original error: {error_msg}")
-                                elif "password" in error_msg.lower() or "encrypted" in error_msg.lower():                                    raise ValueError(f"Failed to load private key: The key appears to be encrypted but no password was provided or the password is incorrect. Original error: {error_msg}")
-                                else:
-                                    raise ValueError(f"Failed to load private key: {error_msg}. Ensure the private key is in PEM format (PKCS#8 or traditional RSA format).")
-                
-                log.info(f"Private key loaded successfully: {type(private_key).__name__}")
-                return cert, private_key
-            
-            # Try P12/PFX format if PEM not available
-            p12_content = self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted()
-            if p12_content:
-                try:
-                    # Decode base64 P12 content
-                    p12_bytes = base64.b64decode(p12_content)
-                    
-                    # Load P12 certificate
-                    p12_password = self.valves.AZURE_P12_PASSWORD.get_decrypted()
-                    password_bytes = p12_password.encode() if p12_password else None
-                    
-                    private_key, cert, additional_certs = serialization.pkcs12.load_key_and_certificates(
-                        p12_bytes, password_bytes
-                    )
-                    
-                    return cert, private_key
-                except Exception as p12_error:
-                    raise ValueError(f"Failed to load P12 certificate: {str(p12_error)}")
-            
-            raise ValueError("No valid certificate found. Please provide either PEM certificate + private key or P12 certificate.")
-            
-        except Exception as e:
-            raise ValueError(f"Certificate loading failed: {str(e)}")
+        begin_marker = f"-----BEGIN {block_type}-----"
+        end_marker = f"-----END {block_type}-----"
+        
+        # Check if content already has proper line breaks
+        lines = pem_content.split('\n')
+        non_empty_lines = [line.strip() for line in lines if line.strip()]
+        
+        # If we have proper line structure, return as-is
+        if len(non_empty_lines) > 10:
+            return pem_content
+        
+        # Content appears flattened - need to restore line breaks
+        log = logging.getLogger(__name__)
+        log.info(f"Restoring line breaks for {block_type}")
+        
+        # Find the base64 content between markers
+        begin_idx = pem_content.find(begin_marker)
+        end_idx = pem_content.find(end_marker)
+        
+        if begin_idx == -1 or end_idx == -1:
+            return pem_content
+        
+        # Extract the base64 content (everything between markers)
+        base64_start = begin_idx + len(begin_marker)
+        base64_content = pem_content[base64_start:end_idx].strip()
+        
+        # Remove all whitespace and rebuild with proper 64-char lines
+        base64_clean = ''.join(base64_content.split())
+        
+        # Split into 64-character lines (standard PEM format)
+        base64_lines = []
+        for i in range(0, len(base64_clean), 64):
+            base64_lines.append(base64_clean[i:i+64])
+        
+        # Reconstruct the PEM with proper formatting
+        reconstructed = begin_marker + '\n' + '\n'.join(base64_lines) + '\n' + end_marker
+        return reconstructed
 
     def _create_client_assertion(self, certificate, private_key) -> str:
         """
@@ -1173,31 +907,6 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         )
         
         return client_assertion
-
-    def _get_raw_private_key_content(self) -> Optional[str]:
-        """
-        Get raw private key content, bypassing any EncryptedStr processing that might corrupt multi-line content.
-        This is a workaround for cases where EncryptedStr corrupts PEM format.
-        """
-        # Try multiple ways to get the raw content
-        attempts = [
-            # Method 1: Use get_decrypted (normal way)
-            lambda: self.valves.AZURE_CLIENT_PRIVATE_KEY.get_decrypted(),
-            # Method 2: Convert to string directly (bypass decryption)
-            lambda: str(self.valves.AZURE_CLIENT_PRIVATE_KEY),
-            # Method 3: If it's encrypted, try to get the raw value before encryption
-            lambda: self.valves.AZURE_CLIENT_PRIVATE_KEY.decrypt(str(self.valves.AZURE_CLIENT_PRIVATE_KEY)),
-        ]
-        
-        for i, attempt in enumerate(attempts):
-            try:
-                content = attempt()
-                if content and "-----BEGIN" in content and "-----END" in content:
-                    return content
-            except Exception:
-                continue
-        
-        return None
 
     async def __aenter__(self):
         """Async context manager entry"""
