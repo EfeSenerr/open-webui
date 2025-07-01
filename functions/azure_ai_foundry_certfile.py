@@ -4,7 +4,7 @@ author: -
 description: A pipeline for interacting with Azure OpenAI services using OAuth2 client credentials authentication with X.509 certificates. This provides enhanced security through certificate-based authentication instead of client secrets.
 features:
   - OAuth2 Client Credentials with certificate authentication
-  - Support for PEM and P12/PFX certificate formats
+  - Support for PEM certificate format (.crt certificate + .pem private key)
   - Automatic token refresh and caching
   - Support for Azure OpenAI deployments
   - Streaming and non-streaming responses
@@ -31,11 +31,7 @@ import base64
 import hashlib
 import time
 import jwt
-import ssl
-import tempfile
 import uuid
-import sys
-import cryptography
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from pydantic_core import core_schema
@@ -174,13 +170,13 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
             description="Azure application (client) ID from App Registration"
         )
 
-        # Certificate content (PEM format) - paste the content of your .pem file here
+        # Certificate content (PEM format) - paste the content of your .crt file here
         AZURE_CLIENT_CERTIFICATE: EncryptedStr = Field(
             default=os.getenv("AZURE_CLIENT_CERTIFICATE", ""),
             description="Certificate content in PEM format (including -----BEGIN CERTIFICATE----- and -----END CERTIFICATE-----)"
         )
 
-        # Private key content (PEM format) - paste the content of your private key file here
+        # Private key content (PEM format) - paste the content of your .pem private key file here
         AZURE_CLIENT_PRIVATE_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_CLIENT_PRIVATE_KEY", ""),
             description="Private key content in PEM format (including -----BEGIN PRIVATE KEY----- and -----END PRIVATE KEY-----)"
@@ -190,18 +186,6 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         AZURE_PRIVATE_KEY_PASSWORD: EncryptedStr = Field(
             default=os.getenv("AZURE_PRIVATE_KEY_PASSWORD", ""),
             description="Password for encrypted private key (leave empty if key is not encrypted)"
-        )
-
-        # Alternative: Base64 encoded P12/PFX certificate file content
-        AZURE_CLIENT_CERTIFICATE_P12: EncryptedStr = Field(
-            default=os.getenv("AZURE_CLIENT_CERTIFICATE_P12", ""),
-            description="Base64 encoded P12/PFX certificate file content (alternative to PEM)"
-        )
-
-        # Password for P12/PFX certificate
-        AZURE_P12_PASSWORD: EncryptedStr = Field(
-            default=os.getenv("AZURE_P12_PASSWORD", ""),
-            description="Password for P12/PFX certificate file"
         )
 
         # Azure OpenAI resource endpoint (base URL without /openai/deployments part)
@@ -244,11 +228,10 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
         if not self.valves.AZURE_CLIENT_ID or self.valves.AZURE_CLIENT_ID == "your-client-id-here":
             raise ValueError("AZURE_CLIENT_ID is required and must be configured!")
         
-        # Check for certificate authentication - either PEM or P12
+        # Check for PEM certificate authentication
         # Handle both EncryptedStr and regular str types safely
         cert_content = ""
         private_key_content = ""
-        p12_content = ""
         
         try:
             cert_content = (
@@ -261,19 +244,13 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
                 if hasattr(self.valves.AZURE_CLIENT_PRIVATE_KEY, 'get_decrypted') 
                 else str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
             )
-            p12_content = (
-                self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted() 
-                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE_P12, 'get_decrypted') 
-                else str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
-            )
         except Exception:
             # Fallback to string values if EncryptedStr methods fail
             cert_content = str(self.valves.AZURE_CLIENT_CERTIFICATE or "")
             private_key_content = str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
-            p12_content = str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
         
-        if not ((cert_content and private_key_content) or p12_content):
-            raise ValueError("Either AZURE_CLIENT_CERTIFICATE + AZURE_CLIENT_PRIVATE_KEY or AZURE_CLIENT_CERTIFICATE_P12 is required!")
+        if not (cert_content and private_key_content):
+            raise ValueError("Both AZURE_CLIENT_CERTIFICATE and AZURE_CLIENT_PRIVATE_KEY are required!")
         
         if not self.valves.AZURE_OPENAI_ENDPOINT:
             raise ValueError("AZURE_OPENAI_ENDPOINT is required!")
@@ -705,7 +682,7 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
 
     def _load_certificate_and_key(self) -> tuple:
         """
-        Load certificate and private key with proper line break handling.
+        Load certificate and private key from PEM format with proper line break handling.
         
         Returns:
             Tuple of (certificate, private_key) objects
@@ -726,84 +703,55 @@ class Pipe:    # Configuration for OAuth2 certificate authentication and Azure O
                 else str(self.valves.AZURE_CLIENT_PRIVATE_KEY or "")
             )
             
-            if cert_content and private_key_content:
-                log = logging.getLogger(__name__)
-                log.info("Loading certificate and private key from PEM format")
-                
-                # Check for CSR instead of certificate
-                if "-----BEGIN CERTIFICATE REQUEST-----" in cert_content:
-                    raise ValueError("Certificate Signing Request (.csr) provided instead of certificate (.crt)")
-                
-                # Load certificate
-                cert = x509.load_pem_x509_certificate(cert_content.encode())
-                
-                # Restore line breaks in PEM content if needed
-                cert_content_fixed = self.restore_pem_line_breaks(cert_content, "CERTIFICATE")
-                private_key_content_fixed = self.restore_pem_line_breaks(private_key_content, "PRIVATE KEY")
-                
-                # Get password if provided
-                password_content = (
-                    self.valves.AZURE_PRIVATE_KEY_PASSWORD.get_decrypted() 
-                    if hasattr(self.valves.AZURE_PRIVATE_KEY_PASSWORD, 'get_decrypted') 
-                    else str(self.valves.AZURE_PRIVATE_KEY_PASSWORD or "")
+            if not cert_content or not private_key_content:
+                raise ValueError("Both certificate and private key content are required")
+
+            log = logging.getLogger(__name__)
+            log.info("Loading certificate and private key from PEM format")
+            
+            # Check for CSR instead of certificate
+            if "-----BEGIN CERTIFICATE REQUEST-----" in cert_content:
+                raise ValueError("Certificate Signing Request (.csr) provided instead of certificate (.crt)")
+            
+            # Restore line breaks in PEM content if needed
+            cert_content_fixed = self.restore_pem_line_breaks(cert_content, "CERTIFICATE")
+            private_key_content_fixed = self.restore_pem_line_breaks(private_key_content, "PRIVATE KEY")
+            
+            # Load certificate
+            cert = x509.load_pem_x509_certificate(cert_content_fixed.encode())
+            
+            # Get password if provided
+            password_content = (
+                self.valves.AZURE_PRIVATE_KEY_PASSWORD.get_decrypted() 
+                if hasattr(self.valves.AZURE_PRIVATE_KEY_PASSWORD, 'get_decrypted') 
+                else str(self.valves.AZURE_PRIVATE_KEY_PASSWORD or "")
+            )
+            key_password = password_content.encode() if password_content else None
+            
+            # Try loading private key with various approaches
+            try:
+                # First try: Combined PEM approach (works for some certificates)
+                combined_pem = cert_content_fixed.strip() + '\n' + private_key_content_fixed.strip()
+                private_key = serialization.load_pem_private_key(
+                    combined_pem.encode('utf-8'),
+                    password=key_password
                 )
-                key_password = password_content.encode() if password_content else None
-                
-                # Try loading private key with various approaches
+            except Exception:
                 try:
-                    # First try: Combined PEM approach (works for some certificates)
-                    combined_pem = cert_content_fixed.strip() + '\n' + private_key_content_fixed.strip()
+                    # Second try: Standard approach
                     private_key = serialization.load_pem_private_key(
-                        combined_pem.encode('utf-8'),
+                        private_key_content_fixed.encode('utf-8'),
                         password=key_password
                     )
                 except Exception:
-                    try:
-                        # Second try: Standard approach
-                        private_key = serialization.load_pem_private_key(
-                            private_key_content_fixed.encode('utf-8'),
-                            password=key_password
-                        )
-                    except Exception:
-                        # Third try: Without password
-                        private_key = serialization.load_pem_private_key(
-                            private_key_content_fixed.encode('utf-8'),
-                            password=None
-                        )
-                
-                log.info(f"Certificate and private key loaded successfully: {type(private_key).__name__}")
-                return cert, private_key
-            
-            # Try P12/PFX format if PEM not available
-            p12_content = (
-                self.valves.AZURE_CLIENT_CERTIFICATE_P12.get_decrypted() 
-                if hasattr(self.valves.AZURE_CLIENT_CERTIFICATE_P12, 'get_decrypted') 
-                else str(self.valves.AZURE_CLIENT_CERTIFICATE_P12 or "")
-            )
-            
-            if p12_content:
-                try:
-                    # Decode base64 P12 content
-                    p12_bytes = base64.b64decode(p12_content)
-                    
-                    # Get P12 password
-                    p12_password_content = (
-                        self.valves.AZURE_P12_PASSWORD.get_decrypted() 
-                        if hasattr(self.valves.AZURE_P12_PASSWORD, 'get_decrypted') 
-                        else str(self.valves.AZURE_P12_PASSWORD or "")
+                    # Third try: Without password
+                    private_key = serialization.load_pem_private_key(
+                        private_key_content_fixed.encode('utf-8'),
+                        password=None
                     )
-                    password_bytes = p12_password_content.encode() if p12_password_content else None
-                    
-                    # Load P12 certificate
-                    private_key, cert, additional_certs = serialization.pkcs12.load_key_and_certificates(
-                        p12_bytes, password_bytes
-                    )
-                    
-                    return cert, private_key
-                except Exception as p12_error:
-                    raise ValueError(f"Failed to load P12 certificate: {str(p12_error)}")
             
-            raise ValueError("No valid certificate found. Please provide either PEM certificate + private key or P12 certificate.")
+            log.info(f"Certificate and private key loaded successfully: {type(private_key).__name__}")
+            return cert, private_key
             
         except Exception as e:
             raise ValueError(f"Certificate loading failed: {str(e)}")
