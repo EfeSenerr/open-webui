@@ -1085,6 +1085,35 @@ OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 
 ####################################
+# COPILOT_API
+####################################
+
+ENABLE_COPILOT_API = PersistentConfig(
+    "ENABLE_COPILOT_API",
+    "copilot.enable",
+    os.environ.get("ENABLE_COPILOT_API", "False").lower() == "true",
+)
+
+GITHUB_TOKEN = PersistentConfig(
+    "GITHUB_TOKEN",
+    "copilot.github_token",
+    os.environ.get("GITHUB_TOKEN", ""),
+)
+
+COPILOT_CLI_PATH = PersistentConfig(
+    "COPILOT_CLI_PATH",
+    "copilot.cli_path",
+    os.environ.get("COPILOT_CLI_PATH", ""),
+)
+
+COPILOT_CLI_URL = PersistentConfig(
+    "COPILOT_CLI_URL",
+    "copilot.cli_url",
+    os.environ.get("COPILOT_CLI_URL", ""),
+)
+
+
+####################################
 # MODELS
 ####################################
 
