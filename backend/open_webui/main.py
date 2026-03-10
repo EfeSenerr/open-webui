@@ -72,6 +72,7 @@ from open_webui.routers import (
     images,
     ollama,
     openai,
+    copilot,
     retrieval,
     pipelines,
     tasks,
@@ -119,6 +120,11 @@ from open_webui.config import (
     OPENAI_API_BASE_URLS,
     OPENAI_API_KEYS,
     OPENAI_API_CONFIGS,
+    # GitHub Copilot
+    ENABLE_COPILOT_API,
+    GITHUB_TOKEN,
+    COPILOT_CLI_PATH,
+    COPILOT_CLI_URL,
     # Direct Connections
     ENABLE_DIRECT_CONNECTIONS,
     # Model list
@@ -692,6 +698,19 @@ app.state.config.OPENAI_API_KEYS = OPENAI_API_KEYS
 app.state.config.OPENAI_API_CONFIGS = OPENAI_API_CONFIGS
 
 app.state.OPENAI_MODELS = {}
+
+########################################
+#
+# GITHUB COPILOT
+#
+########################################
+
+app.state.config.ENABLE_COPILOT_API = ENABLE_COPILOT_API
+app.state.config.GITHUB_TOKEN = GITHUB_TOKEN
+app.state.config.COPILOT_CLI_PATH = COPILOT_CLI_PATH
+app.state.config.COPILOT_CLI_URL = COPILOT_CLI_URL
+
+app.state.COPILOT_CLIENT = None
 
 ########################################
 #
@@ -1364,6 +1383,7 @@ app.mount("/ws", socket_app)
 
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
+app.include_router(copilot.router, prefix="/copilot", tags=["copilot"])
 
 
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
